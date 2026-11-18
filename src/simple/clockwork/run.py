@@ -153,6 +153,8 @@ def main(
     sim_mode: Annotated[str, typer.Option()] = "mujoco_isaac",
     send_cameras: Annotated[str, typer.Option(help="comma list of image keys to send")] = "head_stereo_left,head_stereo_right,third_person",
     pace: Annotated[bool, typer.Option(help="never let world time run ahead of wall time (as upstream)")] = True,
+    free_period: Annotated[bool, typer.Option("--free-period/--no-free-period",
+        help="program-step policy: a request owes only latency beyond the previous chunk's control periods")] = False,
 ):
     import gymnasium as gym
 
@@ -209,7 +211,8 @@ def main(
     observation = render_obs()
     hold = agent.engage(observation["joint_qpos"])
     mon = FaucetMonitor(dt=CONTROL_DT)
-    stats = dict(requests=0, latency_s=0.0, held_steps=0, acting_steps=0, paced_s=0.0, max_latency_s=0.0)
+    prev_chunk_len = 0
+    stats = dict(requests=0, latency_s=0.0, charged_s=0.0, held_steps=0, acting_steps=0, paced_s=0.0, max_latency_s=0.0)
     instruction = task.instruction
     world_steps = 0
     budget_steps = int(round(budget_s / CONTROL_DT))
@@ -273,14 +276,20 @@ def main(
             if mode == "realtime":
                 t_sent = time.monotonic()
                 held = 0
+                free = prev_chunk_len * CONTROL_DT if free_period else 0.0
                 while not fut.done() and not done():
-                    if held * CONTROL_DT < time.monotonic() - t_sent:  # never ahead of wall time
+                    if held * CONTROL_DT < time.monotonic() - t_sent - free:  # never ahead of wall time
                         step_once(held=True, render=video_held_steps and video)
                         held += 1
                     else:
                         time.sleep(0.001)
                 reply, latency = fut.result()
-                owed = int(math.ceil(max(0.0, latency - held * CONTROL_DT) / CONTROL_DT - 1e-6))
+                # --free-period (a program-step policy, as RoboLab real-time mode): a request owes
+                # only the latency beyond the control periods the previous chunk covered, since on
+                # a robot it computes while that chunk moves. Otherwise it owes its whole latency.
+                charged = max(0.0, latency - free)
+                stats["charged_s"] += charged
+                owed = int(math.ceil(max(0.0, charged - held * CONTROL_DT) / CONTROL_DT - 1e-6))
                 for _ in range(owed):
                     if done():
                         break
@@ -294,6 +303,7 @@ def main(
             if done():
                 break
             agent.enqueue_chunk(np.asarray(reply["actions"]))
+            prev_chunk_len = len(reply["actions"])
         step_once(held=False, render=agent.queue_len == 0 or video)
         if mon.success and t_native_success is None:
             t_native_success = mon.t_success
@@ -318,11 +328,12 @@ def main(
         "t_success_s": mon.t_success,
         "t_host_s": round(time.monotonic() - t_host0, 1),
         "policy_latency_s": round(stats["latency_s"], 3),
+        "charged_latency_s": round(stats["charged_s"], 3),
         "requests": stats["requests"], "max_latency_s": round(stats["max_latency_s"], 3),
         "held_steps": stats["held_steps"], "acting_steps": stats["acting_steps"],
         "attempts": mon.attempts, "regrasps": mon.regrasps,
         "retry_events": mon.retry_events, "irreversible": mon.irreversible,
-        "budget_s": budget_s, "final_q0_rad": round(mon.q0, 4),
+        "budget_s": budget_s, "final_q0_rad": round(mon.q0, 4), "free_period": free_period,
         "instruction": instruction, "video": None,
         "server_metadata": client.metadata if isinstance(client.metadata, dict) else None,
     }
