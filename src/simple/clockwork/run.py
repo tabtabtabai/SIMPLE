@@ -196,6 +196,8 @@ def main(
     variant: Annotated[str, typer.Option(help="native | near-start (scored separately)")] = "native",
     third_person: Annotated[bool, typer.Option("--third-person/--no-third-person")] = True,
     policy_detail: Annotated[str, typer.Option(help="what policy_id is, e.g. 'teleop replay of demo k'")] = "",
+    privileged: Annotated[bool, typer.Option("--privileged/--no-privileged",
+        help="the policy uses information a robot would not have (the replay expert knows the demo)")] = False,
     free_period: Annotated[bool, typer.Option("--free-period/--no-free-period",
         help="program-step policy: a request owes only latency beyond the previous chunk's control periods")] = False,
 ):
@@ -390,7 +392,8 @@ def main(
             "t_host_s": round(time.monotonic() - t_host0, 1),
             "policy_latency_s": round(stats["latency_s"], 3),
             "charged_latency_s": round(stats["charged_s"], 3),
-            "requests": stats["requests"], "max_latency_s": round(stats["max_latency_s"], 3),
+            "requests": stats["requests"], "policy_requests": stats["requests"],
+        "max_latency_s": round(stats["max_latency_s"], 3), "privileged": privileged,
             "held_steps": stats["held_steps"], "acting_steps": stats["acting_steps"],
             "t_physics_s": round(world_steps * CONTROL_DT, 3), "charged_world_s": round(charged_world_s, 3),
             "attempts": mon.attempts, "regrasps": mon.regrasps,
