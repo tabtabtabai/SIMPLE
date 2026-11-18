@@ -159,6 +159,8 @@ def main(
     out_dir: Annotated[str, typer.Option()] = "data/clockwork/5.4",
     video: Annotated[bool, typer.Option("--video/--no-video")] = True,
     video_held_steps: Annotated[bool, typer.Option(help="render held steps too, so the video plays world time at 1x")] = True,
+    video_cameras: Annotated[str, typer.Option(help="one mp4 per camera, every control step (D8)")] = "head_stereo_left,head_stereo_right,third_person",
+    gcs_prefix: Annotated[str, typer.Option(help="where the pipeline uploads this episode's files; recorded in `video`")] = "",
     sim_mode: Annotated[str, typer.Option()] = "mujoco_isaac",
     send_cameras: Annotated[str, typer.Option(help="comma list of image keys to send")] = "head_stereo_left,head_stereo_right,third_person",
     pace: Annotated[bool, typer.Option(help="never let world time run ahead of wall time (as upstream)")] = True,
@@ -210,9 +212,8 @@ def main(
     import torch
     agent._wbc_policy.lower_body_policy.gait_indices = torch.zeros((1), dtype=torch.float32)
 
-    writer = None
-    vpath = out / f"{stem}.mp4"
-    vid_key = "third_person" if "third_person" in observation else "head_stereo_left"
+    writers: dict[str, Any] = {}
+    vid_keys = [k for k in video_cameras.split(",") if k]
 
     def render_obs():
         senv.render_isaac = True
@@ -233,7 +234,7 @@ def main(
         return [c for c in send_cameras.split(",") if c in observation]
 
     def step_once(held: bool, render: bool):
-        nonlocal observation, info, world_steps, writer
+        nonlocal observation, info, world_steps
         senv.render_isaac = render or not on_query
         cmd = agent.step_command(held=held)
         observation, _r, _term, _trunc, info = senv.step(cmd)
@@ -242,11 +243,15 @@ def main(
         z, quat = probe.pelvis_pose()
         mon.update(q0=probe.q0(), upstream_success=bool(senv._success), hand_contact=probe.hand_contact(),
                    pelvis_z=z, tilt_rad=tilt_from_quat_wxyz(quat))
-        if video and render and vid_key in observation:
-            if writer is None:
-                import imageio.v2 as imageio
-                writer = imageio.get_writer(vpath, fps=int(round(1 / CONTROL_DT)), macro_block_size=1)
-            writer.append_data(np.asarray(observation[vid_key]))
+        if video and render:
+            for k in vid_keys:
+                if k not in observation:
+                    continue
+                if k not in writers:
+                    import imageio.v2 as imageio
+                    writers[k] = imageio.get_writer(out / f"{stem}_{k}.mp4", fps=int(round(1 / CONTROL_DT)),
+                                                    macro_block_size=1, quality=7)
+                writers[k].append_data(np.asarray(observation[k]))
         if pace:
             ahead = world_steps * CONTROL_DT - (time.monotonic() - wall_anchor)
             if ahead > 0:
@@ -348,9 +353,11 @@ def main(
         "instruction": instruction, "video": None,
         "server_metadata": client.metadata if isinstance(client.metadata, dict) else None,
     }
-    if writer is not None:
-        writer.close()
-        rec["video"] = str(vpath)
+    if writers:
+        for w in writers.values():
+            w.close()
+        names = [f"{stem}_{k}.mp4" for k in writers]
+        rec["video"] = [f"{gcs_prefix.rstrip('/')}/{n}" if gcs_prefix else str(out / n) for n in names]
     (out / f"{stem}.json").write_text(json.dumps(rec, indent=2, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
     print(json.dumps({k: rec[k] for k in ("success", "success_strict", "t_wall_s", "attempts", "irreversible", "success_detail")}), flush=True)
     client.close()
