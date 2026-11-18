@@ -171,3 +171,58 @@ class FaucetMonitor:
     def progress(self) -> float:
         """Partial credit, reported only: fraction of the 0.7 rad opening reached."""
         return float(min(1.0, self.max_abs_q0 / OPEN_RAD))
+
+
+# ---------------------------------------------------------------------------- physics checks
+# CONTRACT "Physics checks": reported beside the score, never scored. Thresholds are the contract's.
+@dataclass
+class PhysicsQA:
+    settle_q0: list[float] = field(default_factory=list)      # faucet joint 0 during stabilization (no action)
+    settle_base: list[np.ndarray] = field(default_factory=list)  # faucet base position during stabilization
+    z_min: float = float("inf")
+    z_max: float = float("-inf")
+    tilt_max: float = 0.0
+    max_force_n: float = 0.0
+    max_pen_m: float = 0.0
+    joint_limit_steps: int = 0
+
+    def settle(self, q0: float, base_xyz) -> None:
+        self.settle_q0.append(float(q0))
+        self.settle_base.append(np.asarray(base_xyz, dtype=float))
+
+    def step(self, *, pelvis_z: float, tilt_rad: float, contact_force_n: float, penetration_m: float,
+             joint_limit_violation: bool) -> None:
+        self.z_min, self.z_max = min(self.z_min, pelvis_z), max(self.z_max, pelvis_z)
+        self.tilt_max = max(self.tilt_max, tilt_rad)
+        self.max_force_n = max(self.max_force_n, contact_force_n)
+        self.max_pen_m = max(self.max_pen_m, penetration_m)
+        self.joint_limit_steps += int(joint_limit_violation)
+
+    def report(self) -> dict:
+        out: dict = {}
+        if self.settle_q0:
+            q = np.asarray(self.settle_q0)
+            out["settle_drift_deg"] = round(float(np.rad2deg(np.max(np.abs(q - q[0])))), 4)
+            b = np.stack(self.settle_base)
+            out["settle_drift_mm"] = round(float(np.max(np.linalg.norm(b - b[0], axis=1)) * 1e3), 4)
+        if self.z_max >= self.z_min:
+            out["base_height_range_m"] = round(self.z_max - self.z_min, 4)
+            out["base_tilt_max_deg"] = round(float(np.rad2deg(self.tilt_max)), 3)
+        out["max_contact_force_n"] = round(self.max_force_n, 3)
+        out["max_penetration_mm"] = round(self.max_pen_m * 1e3, 3)
+        out["joint_limit_violations"] = self.joint_limit_steps
+        flags = []
+        if out.get("settle_drift_mm", 0) > 1:
+            flags.append("settle_drift_mm")
+        if out.get("settle_drift_deg", 0) > 0.5:
+            flags.append("settle_drift_deg")
+        if out["max_penetration_mm"] > 2:
+            flags.append("max_penetration_mm")
+        if out["joint_limit_violations"] > 0:
+            flags.append("joint_limit_violations")
+        if out.get("base_height_range_m", 0) > 0.03:
+            flags.append("base_height_range_m")
+        if out.get("base_tilt_max_deg", 0) > 5:
+            flags.append("base_tilt_max_deg")
+        out["flags"] = flags
+        return out

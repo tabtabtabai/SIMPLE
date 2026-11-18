@@ -94,3 +94,16 @@ def test_wire_roundtrip():
     assert back["prompt"] == "turn the faucet"
     np.testing.assert_array_equal(back["images"]["a"], obs["images"]["a"])
     assert back["state"].dtype == np.float32
+
+
+def test_physics_qa_flags():
+    from simple.clockwork.monitor import PhysicsQA
+    qa = PhysicsQA()
+    for q in (0.0, 0.0, 0.02):  # 1.1 deg settle drift
+        qa.settle(q, [0, 0, 0.7])
+    qa.step(pelvis_z=0.74, tilt_rad=0.01, contact_force_n=3.0, penetration_m=0.001, joint_limit_violation=False)
+    qa.step(pelvis_z=0.70, tilt_rad=0.02, contact_force_n=5.0, penetration_m=0.0025, joint_limit_violation=True)
+    r = qa.report()
+    assert r["max_contact_force_n"] == 5.0 and r["joint_limit_violations"] == 1
+    assert r["base_height_range_m"] == 0.04
+    assert set(r["flags"]) == {"settle_drift_deg", "max_penetration_mm", "joint_limit_violations", "base_height_range_m"}

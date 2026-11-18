@@ -73,6 +73,33 @@ class MjProbe:
     def q0(self) -> float:
         return float(self.d.joint("articulate_joint_0").qpos[0])
 
+    def setup_joint_limits(self, joint_names: list[str]) -> None:
+        m, mj = self.m, self.mujoco
+        self._lim = []
+        for n in joint_names:
+            j = mj.mj_name2id(m, mj.mjtObj.mjOBJ_JOINT, n)
+            if j >= 0 and m.jnt_limited[j]:
+                self._lim.append((int(m.jnt_qposadr[j]), float(m.jnt_range[j][0]), float(m.jnt_range[j][1])))
+
+    def joint_limit_violation(self, tol: float = 1e-3) -> bool:
+        q = self.d.qpos
+        return any(q[a] < lo - tol or q[a] > hi + tol for a, lo, hi in getattr(self, "_lim", []))
+
+    def contact_stats(self) -> tuple[bool, float, float]:
+        """(hand touches faucet, total normal force hand->faucet in N, deepest hand-faucet penetration in m)."""
+        gb = self.m.geom_bodyid
+        f6 = np.zeros(6)
+        touch, force, pen = False, 0.0, 0.0
+        for i in range(self.d.ncon):
+            c = self.d.contact[i]
+            b1, b2 = gb[c.geom1], gb[c.geom2]
+            if (b1 in self.hand_bodies and b2 in self.faucet_bodies) or (b2 in self.hand_bodies and b1 in self.faucet_bodies):
+                touch = True
+                self.mujoco.mj_contactForce(self.m, self.d, i, f6)
+                force += abs(float(f6[0]))
+                pen = max(pen, -float(c.dist))
+        return touch, force, pen
+
     def hand_contact(self) -> bool:
         gb = self.m.geom_bodyid
         for i in range(self.d.ncon):
@@ -226,7 +253,7 @@ def main(
     import simple.envs as _  # noqa: F401
     from simple.cli.eval_decoupled_wbc import _make_sonic_config
     from simple.clockwork.agent import ClockworkWsAgent
-    from simple.clockwork.monitor import FaucetMonitor, tilt_from_quat_wxyz
+    from simple.clockwork.monitor import FaucetMonitor, PhysicsQA, tilt_from_quat_wxyz
     from simple.clockwork.wire import WsPolicyClient
 
     assert mode in ("realtime", "charged", "lockstep"), mode
@@ -262,6 +289,8 @@ def main(
         agent.reset()
         agent._wbc_policy.lower_body_policy.use_policy_action = True
         probe = MjProbe(senv.mujoco)
+        probe.setup_joint_limits(list(robot.joint_names))
+        qa = PhysicsQA()
         print(f"[clockwork] task success_criteria={task.metadata.get('success_criteria')} "
               f"faucet bodies={len(probe.faucet_bodies)} hand bodies={len(probe.hand_bodies)}", flush=True)
 
@@ -270,6 +299,7 @@ def main(
         n = 0
         while not robot.stabilized and n < 300:
             observation, *_ = senv.step(agent.get_stabilize_action(observation))
+            qa.settle(probe.q0(), probe.faucet_base())
             n += 1
         import torch
         agent._wbc_policy.lower_body_policy.gait_indices = torch.zeros((1), dtype=torch.float32)
@@ -305,8 +335,12 @@ def main(
             world_steps += 1
             stats["held_steps" if held else "acting_steps"] += 1
             z, quat = probe.pelvis_pose()
-            mon.update(q0=probe.q0(), upstream_success=bool(senv._success), hand_contact=probe.hand_contact(),
-                       pelvis_z=z, tilt_rad=tilt_from_quat_wxyz(quat))
+            touch, force, pen = probe.contact_stats()
+            tilt = tilt_from_quat_wxyz(quat)
+            mon.update(q0=probe.q0(), upstream_success=bool(senv._success), hand_contact=touch,
+                       pelvis_z=z, tilt_rad=tilt)
+            qa.step(pelvis_z=z, tilt_rad=tilt, contact_force_n=force, penetration_m=pen,
+                    joint_limit_violation=probe.joint_limit_violation())
             if video and render:
                 for k in vid_keys:
                     if k not in observation:
@@ -427,6 +461,7 @@ def main(
         "pelvis_end_world": [round(float(v), 4) for v in probe.pelvis_T_world()[:3, 3]],
         "faucet_base_world": [round(float(v), 4) for v in probe.faucet_base()],
         "near_start_dx": near_start_dx, "spawn_shift": spawn_shift,
+        "physics_qa": qa.report(), "render_version": 1,
             "instruction": instruction, "video": None,
             "server_metadata": client.metadata if isinstance(client.metadata, dict) else None,
         }
