@@ -83,6 +83,15 @@ class MjProbe:
                 return True
         return False
 
+    def pelvis_T_world(self) -> np.ndarray:
+        """4x4 world<-pelvis transform."""
+        T = np.eye(4, dtype=np.float32)
+        q = np.zeros(9)
+        self.mujoco.mju_quat2Mat(q, self.d.xquat[self.pelvis])
+        T[:3, :3] = q.reshape(3, 3)
+        T[:3, 3] = self.d.xpos[self.pelvis]
+        return T
+
     def pelvis_pose(self) -> tuple[float, np.ndarray]:
         return float(self.d.xpos[self.pelvis][2]), np.array(self.d.xquat[self.pelvis])
 
@@ -153,6 +162,7 @@ def main(
     sim_mode: Annotated[str, typer.Option()] = "mujoco_isaac",
     send_cameras: Annotated[str, typer.Option(help="comma list of image keys to send")] = "head_stereo_left,head_stereo_right,third_person",
     pace: Annotated[bool, typer.Option(help="never let world time run ahead of wall time (as upstream)")] = True,
+    variant: Annotated[str, typer.Option(help="native | near-start (scored separately)")] = "native",
     free_period: Annotated[bool, typer.Option("--free-period/--no-free-period",
         help="program-step policy: a request owes only latency beyond the previous chunk's control periods")] = False,
 ):
@@ -249,6 +259,7 @@ def main(
         return {
             "images": {k: np.asarray(observation[k], dtype=np.uint8) for k in names},
             "camera_info": probe.camera_info(names, hw),
+            "pelvis_pose_world": probe.pelvis_T_world(),
             "state": np.asarray(observation["joint_qpos"], dtype=np.float32),
             "state_names": list(robot.joint_names),
             "hold_command": agent.last_wire.copy(),
@@ -313,7 +324,7 @@ def main(
     success = mon.success and not mon.fell
     success_native = success and mon.t_success is not None and mon.t_success <= NATIVE_MAX_STEPS * CONTROL_DT
     rec = {
-        "test_id": "5.4", "benchmark": "SIMPLE", "task": "OpenFaucet",
+        "test_id": "5.4", "benchmark": "SIMPLE", "task": "OpenFaucet", "variant": variant,
         "env_id": ENV_ID, "robot": "Unitree G1 whole-body (Dex3, decoupled WBC)",
         "sim": f"MuJoCo 3.12 physics + Isaac Sim 6.2 render ({sim_mode})",
         "seed": episode, "split": split, "data_dir": data_dir, "dataset_episode_index": global_episode,
