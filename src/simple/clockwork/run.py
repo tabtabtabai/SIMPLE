@@ -83,6 +83,10 @@ class MjProbe:
                 return True
         return False
 
+    def faucet_base(self) -> np.ndarray:
+        b = self.mujoco.mj_name2id(self.m, self.mujoco.mjtObj.mjOBJ_BODY, "articulate_base")
+        return np.array(self.d.xpos[b])
+
     def pelvis_T_world(self) -> np.ndarray:
         """4x4 world<-pelvis transform."""
         T = np.eye(4, dtype=np.float32)
@@ -142,6 +146,19 @@ def add_third_person_camera() -> None:
 TASK_UID = "g1_wholebody_open_faucet_teleop"
 
 
+def shift_robot_spawn(env_conf: dict, dx: float) -> dict:
+    """Near-start variant: move the robot's spawn dx metres along its own heading (toward the faucet).
+    Edits dr_state_dict.spatial.<robot uid>.position in place; returns what changed."""
+    spatial = env_conf["dr_state_dict"]["spatial"]
+    key = next(k for k in ("g1_sonic", "robot") if k in spatial)
+    pose = spatial[key]
+    w, x, y, z = pose["quaternion"]
+    yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    before = list(pose["position"])
+    pose["position"] = [before[0] + dx * math.cos(yaw), before[1] + dx * math.sin(yaw), before[2]]
+    return {"key": key, "from": [round(v, 4) for v in before], "to": [round(v, 4) for v in pose["position"]]}
+
+
 def task_episode_ids(data_dir: str, task_uid: str = TASK_UID) -> list[int]:
     """Positions (as LeRobotParquetDataset / get_episode_lerobot index them: episodes sorted by
     episode_index) of this task's episodes.
@@ -196,6 +213,8 @@ def main(
     pace: Annotated[bool, typer.Option(help="never let world time run ahead of wall time (as upstream)")] = True,
     variant: Annotated[str, typer.Option(help="native | near-start (scored separately)")] = "native",
     third_person: Annotated[bool, typer.Option("--third-person/--no-third-person")] = True,
+    near_start_dx: Annotated[float, typer.Option(help="near-start variant: move the robot's spawn this far (m) "
+        "along its heading toward the faucet; 0 = the episode's own start")] = 0.0,
     policy_detail: Annotated[str, typer.Option(help="what policy_id is, e.g. 'teleop replay of demo k'")] = "",
     privileged: Annotated[bool, typer.Option("--privileged/--no-privileged",
         help="the policy uses information a robot would not have (the replay expert knows the demo)")] = False,
@@ -236,6 +255,9 @@ def main(
         t_host0 = time.monotonic()
         stem = f"{split}_ep{episode}"
         env_conf, global_episode = load_episode(data_dir, episode)
+        spawn_shift = None
+        if near_start_dx:
+            spawn_shift = shift_robot_spawn(env_conf, near_start_dx)
         observation, info = senv.reset(options={"state_dict": env_conf})
         agent.reset()
         agent._wbc_policy.lower_body_policy.use_policy_action = True
@@ -261,6 +283,7 @@ def main(
 
         observation = render_obs()
         hold = agent.engage(observation["joint_qpos"])
+        pelvis_start = probe.pelvis_T_world()[:3, 3].tolist()
         mon = FaucetMonitor(dt=CONTROL_DT)
         prev_chunk_len = 0
         charged_world_s = 0.0  # charged mode: latency added to world time without stepping
@@ -400,6 +423,10 @@ def main(
             "attempts": mon.attempts, "regrasps": mon.regrasps,
             "retry_events": mon.retry_events, "irreversible": mon.irreversible,
             "budget_s": budget_s, "final_q0_rad": round(mon.q0, 4), "free_period": free_period,
+        "pelvis_start_world": [round(v, 4) for v in pelvis_start],
+        "pelvis_end_world": [round(float(v), 4) for v in probe.pelvis_T_world()[:3, 3]],
+        "faucet_base_world": [round(float(v), 4) for v in probe.faucet_base()],
+        "near_start_dx": near_start_dx, "spawn_shift": spawn_shift,
             "instruction": instruction, "video": None,
             "server_metadata": client.metadata if isinstance(client.metadata, dict) else None,
         }
