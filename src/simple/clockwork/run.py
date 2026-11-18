@@ -461,7 +461,7 @@ def main(
         "pelvis_end_world": [round(float(v), 4) for v in probe.pelvis_T_world()[:3, 3]],
         "faucet_base_world": [round(float(v), 4) for v in probe.faucet_base()],
         "near_start_dx": near_start_dx, "spawn_shift": spawn_shift,
-        "physics_qa": qa.report(), "render_version": 1,
+        "physics_qa": qa.report(), "render_version": int(os.environ.get("CW5_RENDER_VERSION", "1")),
         "wrapper_sha": os.environ.get("CW5_FORK_SHA", "unknown"),
             "instruction": instruction, "video": None,
             "server_metadata": client.metadata if isinstance(client.metadata, dict) else None,
