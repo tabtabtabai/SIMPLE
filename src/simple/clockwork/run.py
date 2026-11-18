@@ -156,7 +156,7 @@ def main(
     episode: Annotated[int, typer.Option()] = 0,
     host: Annotated[str, typer.Option()] = "127.0.0.1",
     port: Annotated[int, typer.Option()] = 8000,
-    mode: Annotated[str, typer.Option(help="realtime | lockstep")] = "realtime",
+    mode: Annotated[str, typer.Option(help="realtime | charged | lockstep (CONTRACT 2, D9)")] = "realtime",
     policy_id: Annotated[str, typer.Option()] = "unknown",
     split: Annotated[str, typer.Option(help="label for the record, e.g. dr-level-0 or teleop")] = "",
     budget_s: Annotated[float, typer.Option(help="world-time limit; contract: max(60, 6*ref_s)")] = 60.0,
@@ -181,7 +181,7 @@ def main(
     from simple.clockwork.monitor import FaucetMonitor, tilt_from_quat_wxyz
     from simple.clockwork.wire import WsPolicyClient
 
-    assert mode in ("realtime", "lockstep"), mode
+    assert mode in ("realtime", "charged", "lockstep"), mode
     t_host0 = time.monotonic()
     split = split or Path(data_dir).name
     out = Path(out_dir) / policy_id / mode
@@ -228,6 +228,7 @@ def main(
     hold = agent.engage(observation["joint_qpos"])
     mon = FaucetMonitor(dt=CONTROL_DT)
     prev_chunk_len = 0
+    charged_world_s = 0.0  # charged mode: latency added to world time without stepping
     stats = dict(requests=0, latency_s=0.0, charged_s=0.0, held_steps=0, acting_steps=0, paced_s=0.0, max_latency_s=0.0)
     instruction = task.instruction
     world_steps = 0
@@ -274,7 +275,7 @@ def main(
             "state_names": list(robot.joint_names),
             "hold_command": agent.last_wire.copy(),
             "prompt": instruction,
-            "t_robot": world_steps * CONTROL_DT,
+            "t_robot": world_steps * CONTROL_DT + charged_world_s,
             "reset": stats["requests"] == 0,
             "episode": episode,
             "robot": "unitree_g1_dex3_decoupled_wbc",
@@ -282,7 +283,7 @@ def main(
         }
 
     def done() -> bool:
-        if mon.fell or world_steps >= budget_steps:
+        if mon.fell or world_steps * CONTROL_DT + charged_world_s >= budget_s - 1e-9:
             return True
         if mon.success and (not strict_tail or mon.strict_met):
             return True
@@ -318,7 +319,14 @@ def main(
                     held += 1
             else:
                 reply, latency = fut.result()
-                wall_anchor += latency  # lockstep: the world is frozen while waiting
+                wall_anchor += latency  # the physics is frozen while waiting
+                if mode == "charged":
+                    # D9: the world stands still while the request is out, and its latency is
+                    # added to world time and the robot clock (free period as in realtime).
+                    c = max(0.0, latency - (prev_chunk_len * CONTROL_DT if free_period else 0.0))
+                    charged_world_s += c
+                    stats["charged_s"] += c
+                    mon.t += c  # monitor clock: a frozen open handle stays open for c
             stats["latency_s"] += latency
             stats["max_latency_s"] = max(stats["max_latency_s"], latency)
             if done():
@@ -330,7 +338,7 @@ def main(
             t_native_success = mon.t_success
 
     # ------------------------------------------------------------------ record
-    t_world = world_steps * CONTROL_DT
+    t_world = world_steps * CONTROL_DT + charged_world_s
     success = mon.success and not mon.fell
     success_native = success and mon.t_success is not None and mon.t_success <= NATIVE_MAX_STEPS * CONTROL_DT
     rec = {
@@ -352,6 +360,7 @@ def main(
         "charged_latency_s": round(stats["charged_s"], 3),
         "requests": stats["requests"], "max_latency_s": round(stats["max_latency_s"], 3),
         "held_steps": stats["held_steps"], "acting_steps": stats["acting_steps"],
+        "t_physics_s": round(world_steps * CONTROL_DT, 3), "charged_world_s": round(charged_world_s, 3),
         "attempts": mon.attempts, "regrasps": mon.regrasps,
         "retry_events": mon.retry_events, "irreversible": mon.irreversible,
         "budget_s": budget_s, "final_q0_rad": round(mon.q0, 4), "free_period": free_period,
