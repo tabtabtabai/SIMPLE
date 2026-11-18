@@ -114,10 +114,11 @@ class MjProbe:
 
 
 # ---------------------------------------------------------------------------- cameras
-# A fixed view from the robot's right, above the sink, looking at the faucet. eye_on_base poses are
-# in the robot's spawn frame in Isaac (camera parented to the robot prim); x forward, z up.
-THIRD_PERSON_POS = (0.35, -1.25, 1.45)
-THIRD_PERSON_LOOK_AT = (0.45, 0.0, 0.85)
+# A fixed view from the robot's right, looking at the robot and the faucet, which stands at the table's
+# near edge (task: robot x -1.2..-1.1, faucet x -0.75..-0.7, z 0.7). eye_on_base poses are WORLD poses
+# in this task (checked on rendered frames: a robot-frame reading pointed the camera at the table).
+THIRD_PERSON_POS = (-0.55, -1.55, 1.55)
+THIRD_PERSON_LOOK_AT = (-0.9, 0.0, 0.85)
 
 
 def add_third_person_camera() -> None:
