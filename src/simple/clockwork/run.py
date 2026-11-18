@@ -118,19 +118,24 @@ TASK_UID = "g1_wholebody_open_faucet_teleop"
 
 
 def task_episode_ids(data_dir: str, task_uid: str = TASK_UID) -> list[int]:
-    """Global episode indices whose environment_config is this task, in dataset order.
+    """Positions (as LeRobotParquetDataset / get_episode_lerobot index them: episodes sorted by
+    episode_index) of this task's episodes.
 
     The eval set holds one task per dir; the merged teleop set holds 12 tasks, so seed k
     means the k-th OpenFaucet episode there."""
-    ids = []
+    eps = []
     with open(Path(data_dir) / "meta" / "episodes.jsonl") as f:
         for line in f:
-            ep = json.loads(line)
-            cfg = ep.get("environment_config")
-            cfg = json.loads(cfg) if isinstance(cfg, str) else (cfg or {})
-            if cfg.get("uid") == task_uid:
-                ids.append(int(ep["episode_index"]))
-    return ids
+            if line.strip():
+                eps.append(json.loads(line))
+    eps.sort(key=lambda e: e["episode_index"])
+    out = []
+    for pos, ep in enumerate(eps):
+        cfg = ep.get("environment_config")
+        cfg = json.loads(cfg) if isinstance(cfg, str) else (cfg or {})
+        if cfg.get("uid") == task_uid:
+            out.append(pos)
+    return out
 
 
 def load_episode(data_dir: str, k: int) -> tuple[dict, int]:
@@ -141,7 +146,7 @@ def load_episode(data_dir: str, k: int) -> tuple[dict, int]:
         raise IndexError(f"{data_dir} has {len(ids)} {TASK_UID} episodes, asked for #{k}")
     ds = LeRobotParquetDataset(data_dir)
     env_conf, _ = get_episode_lerobot(ds, ids[k], load_videos=False)
-    return env_conf, ids[k]
+    return env_conf, int(ds.meta.episodes[ids[k]]["episode_index"])
 
 
 # ---------------------------------------------------------------------------- main
