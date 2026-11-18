@@ -177,7 +177,7 @@ def load_episode(data_dir: str, k: int) -> tuple[dict, int]:
 @app.command()
 def main(
     data_dir: Annotated[str, typer.Option(help="LeRobot dir with environment_config per episode")],
-    episode: Annotated[int, typer.Option()] = 0,
+    episodes: Annotated[str, typer.Option(help="seeds, e.g. '0 1 2' or '0-9'; one env, reset per episode")] = "0",
     host: Annotated[str, typer.Option()] = "127.0.0.1",
     port: Annotated[int, typer.Option()] = 8000,
     mode: Annotated[str, typer.Option(help="realtime | charged | lockstep (CONTRACT 2, D9)")] = "realtime",
@@ -189,7 +189,7 @@ def main(
     video: Annotated[bool, typer.Option("--video/--no-video")] = True,
     video_held_steps: Annotated[bool, typer.Option(help="render held steps too, so the video plays world time at 1x")] = True,
     video_cameras: Annotated[str, typer.Option(help="one mp4 per camera, every control step (D8)")] = "head_stereo_left,head_stereo_right,third_person",
-    gcs_prefix: Annotated[str, typer.Option(help="where the pipeline uploads this episode's files; recorded in `video`")] = "",
+    gcs_prefix: Annotated[str, typer.Option(help="per-episode upload dir recorded in `video`; {seed} is substituted")] = "",
     sim_mode: Annotated[str, typer.Option()] = "mujoco_isaac",
     send_cameras: Annotated[str, typer.Option(help="comma list of image keys to send")] = "head_stereo_left,head_stereo_right,third_person",
     pace: Annotated[bool, typer.Option(help="never let world time run ahead of wall time (as upstream)")] = True,
@@ -208,13 +208,13 @@ def main(
     from simple.clockwork.wire import WsPolicyClient
 
     assert mode in ("realtime", "charged", "lockstep"), mode
-    t_host0 = time.monotonic()
     split = split or Path(data_dir).name
     out = Path(out_dir) / policy_id / mode
     out.mkdir(parents=True, exist_ok=True)
-    stem = f"{split}_ep{episode}"
-
-    env_conf, global_episode = load_episode(data_dir, episode)
+    seeds: list[int] = []
+    for tok in episodes.replace(",", " ").split():
+        lo, _, hi = tok.partition("-")
+        seeds += list(range(int(lo), int(hi) + 1)) if hi else [int(lo)]
     if third_person:
         add_third_person_camera()
     sonic_config = _make_sonic_config()
@@ -229,179 +229,190 @@ def main(
     client = WsPolicyClient(host, port)
     pool = cf.ThreadPoolExecutor(max_workers=1)
 
-    observation, info = senv.reset(options={"state_dict": env_conf})
-    agent.reset()
-    agent._wbc_policy.lower_body_policy.use_policy_action = True
-    probe = MjProbe(senv.mujoco)
-    print(f"[clockwork] task success_criteria={task.metadata.get('success_criteria')} "
-          f"faucet bodies={len(probe.faucet_bodies)} hand bodies={len(probe.hand_bodies)}", flush=True)
+    def run_one(episode: int) -> None:
+        t_host0 = time.monotonic()
+        stem = f"{split}_ep{episode}"
+        env_conf, global_episode = load_episode(data_dir, episode)
+        observation, info = senv.reset(options={"state_dict": env_conf})
+        agent.reset()
+        agent._wbc_policy.lower_body_policy.use_policy_action = True
+        probe = MjProbe(senv.mujoco)
+        print(f"[clockwork] task success_criteria={task.metadata.get('success_criteria')} "
+              f"faucet bodies={len(probe.faucet_bodies)} hand bodies={len(probe.hand_bodies)}", flush=True)
 
-    # --- SIMPLE's own stabilization (not on the clock) ---
-    senv.render_isaac = not on_query
-    n = 0
-    while not robot.stabilized and n < 300:
-        observation, *_ = senv.step(agent.get_stabilize_action(observation))
-        n += 1
-    import torch
-    agent._wbc_policy.lower_body_policy.gait_indices = torch.zeros((1), dtype=torch.float32)
+        # --- SIMPLE's own stabilization (not on the clock) ---
+        senv.render_isaac = not on_query
+        n = 0
+        while not robot.stabilized and n < 300:
+            observation, *_ = senv.step(agent.get_stabilize_action(observation))
+            n += 1
+        import torch
+        agent._wbc_policy.lower_body_policy.gait_indices = torch.zeros((1), dtype=torch.float32)
 
-    writers: dict[str, Any] = {}
-    vid_keys = [k for k in video_cameras.split(",") if k]
+        writers: dict[str, Any] = {}
+        vid_keys = [k for k in video_cameras.split(",") if k]
 
-    def render_obs():
-        senv.render_isaac = True
-        return senv.refresh_obs()
+        def render_obs():
+            senv.render_isaac = True
+            return senv.refresh_obs()
 
-    observation = render_obs()
-    hold = agent.engage(observation["joint_qpos"])
-    mon = FaucetMonitor(dt=CONTROL_DT)
-    prev_chunk_len = 0
-    charged_world_s = 0.0  # charged mode: latency added to world time without stepping
-    stats = dict(requests=0, latency_s=0.0, charged_s=0.0, held_steps=0, acting_steps=0, paced_s=0.0, max_latency_s=0.0)
-    instruction = task.instruction
-    world_steps = 0
-    budget_steps = int(round(budget_s / CONTROL_DT))
-    t_native_success = None
-    wall_anchor = time.monotonic()  # pacing anchor: wall time when world_steps was 0
+        observation = render_obs()
+        hold = agent.engage(observation["joint_qpos"])
+        mon = FaucetMonitor(dt=CONTROL_DT)
+        prev_chunk_len = 0
+        charged_world_s = 0.0  # charged mode: latency added to world time without stepping
+        stats = dict(requests=0, latency_s=0.0, charged_s=0.0, held_steps=0, acting_steps=0, paced_s=0.0, max_latency_s=0.0)
+        instruction = task.instruction
+        world_steps = 0
+        budget_steps = int(round(budget_s / CONTROL_DT))
+        t_native_success = None
+        wall_anchor = time.monotonic()  # pacing anchor: wall time when world_steps was 0
 
-    def cams() -> list[str]:
-        return [c for c in send_cameras.split(",") if c in observation]
+        def cams() -> list[str]:
+            return [c for c in send_cameras.split(",") if c in observation]
 
-    def step_once(held: bool, render: bool):
-        nonlocal observation, info, world_steps
-        senv.render_isaac = render or not on_query
-        cmd = agent.step_command(held=held)
-        observation, _r, _term, _trunc, info = senv.step(cmd)
-        world_steps += 1
-        stats["held_steps" if held else "acting_steps"] += 1
-        z, quat = probe.pelvis_pose()
-        mon.update(q0=probe.q0(), upstream_success=bool(senv._success), hand_contact=probe.hand_contact(),
-                   pelvis_z=z, tilt_rad=tilt_from_quat_wxyz(quat))
-        if video and render:
-            for k in vid_keys:
-                if k not in observation:
-                    continue
-                if k not in writers:
-                    import imageio.v2 as imageio
-                    writers[k] = imageio.get_writer(out / f"{stem}_{k}.mp4", fps=int(round(1 / CONTROL_DT)),
-                                                    macro_block_size=1, quality=7)
-                writers[k].append_data(np.asarray(observation[k]))
-        if pace:
-            ahead = world_steps * CONTROL_DT - (time.monotonic() - wall_anchor)
-            if ahead > 0:
-                time.sleep(ahead)
-                stats["paced_s"] += ahead
+        def step_once(held: bool, render: bool):
+            nonlocal observation, info, world_steps
+            senv.render_isaac = render or not on_query
+            cmd = agent.step_command(held=held)
+            observation, _r, _term, _trunc, info = senv.step(cmd)
+            world_steps += 1
+            stats["held_steps" if held else "acting_steps"] += 1
+            z, quat = probe.pelvis_pose()
+            mon.update(q0=probe.q0(), upstream_success=bool(senv._success), hand_contact=probe.hand_contact(),
+                       pelvis_z=z, tilt_rad=tilt_from_quat_wxyz(quat))
+            if video and render:
+                for k in vid_keys:
+                    if k not in observation:
+                        continue
+                    if k not in writers:
+                        import imageio.v2 as imageio
+                        writers[k] = imageio.get_writer(out / f"{stem}_{k}.mp4", fps=int(round(1 / CONTROL_DT)),
+                                                        macro_block_size=1, quality=7)
+                    writers[k].append_data(np.asarray(observation[k]))
+            if pace:
+                ahead = world_steps * CONTROL_DT - (time.monotonic() - wall_anchor)
+                if ahead > 0:
+                    time.sleep(ahead)
+                    stats["paced_s"] += ahead
 
-    def build_request() -> dict:
-        names = cams()
-        hw = {k: observation[k].shape[:2] for k in names}
-        return {
-            "images": {k: np.asarray(observation[k], dtype=np.uint8) for k in names},
-            "camera_info": probe.camera_info(names, hw),
-            "pelvis_pose_world": probe.pelvis_T_world(),
-            "state": np.asarray(observation["joint_qpos"], dtype=np.float32),
-            "state_names": list(robot.joint_names),
-            "hold_command": agent.last_wire.copy(),
-            "prompt": instruction,
-            "t_robot": world_steps * CONTROL_DT + charged_world_s,
-            "reset": stats["requests"] == 0,
-            "episode": episode,
-            "robot": "unitree_g1_dex3_decoupled_wbc",
-            "action_space": "simple-decoupled-wbc-36",
-        }
+        def build_request() -> dict:
+            names = cams()
+            hw = {k: observation[k].shape[:2] for k in names}
+            return {
+                "images": {k: np.asarray(observation[k], dtype=np.uint8) for k in names},
+                "camera_info": probe.camera_info(names, hw),
+                "pelvis_pose_world": probe.pelvis_T_world(),
+                "state": np.asarray(observation["joint_qpos"], dtype=np.float32),
+                "state_names": list(robot.joint_names),
+                "hold_command": agent.last_wire.copy(),
+                "prompt": instruction,
+                "t_robot": world_steps * CONTROL_DT + charged_world_s,
+                "reset": stats["requests"] == 0,
+                "episode": episode,
+                "robot": "unitree_g1_dex3_decoupled_wbc",
+                "action_space": "simple-decoupled-wbc-36",
+            }
 
-    def done() -> bool:
-        if mon.fell or world_steps * CONTROL_DT + charged_world_s >= budget_s - 1e-9:
-            return True
-        if mon.success and (not strict_tail or mon.strict_met):
-            return True
-        return False
+        def done() -> bool:
+            if mon.fell or world_steps * CONTROL_DT + charged_world_s >= budget_s - 1e-9:
+                return True
+            if mon.success and (not strict_tail or mon.strict_met):
+                return True
+            return False
 
-    # ------------------------------------------------------------------ policy loop
-    while not done():
-        if agent.queue_len == 0:
-            req = build_request()
-            stats["requests"] += 1
-            fut = pool.submit(client.infer, req)
-            if mode == "realtime":
-                t_sent = time.monotonic()
-                held = 0
-                free = prev_chunk_len * CONTROL_DT if free_period else 0.0
-                while not fut.done() and not done():
-                    if held * CONTROL_DT < time.monotonic() - t_sent - free:  # never ahead of wall time
+        # ------------------------------------------------------------------ policy loop
+        while not done():
+            if agent.queue_len == 0:
+                req = build_request()
+                stats["requests"] += 1
+                fut = pool.submit(client.infer, req)
+                if mode == "realtime":
+                    t_sent = time.monotonic()
+                    held = 0
+                    free = prev_chunk_len * CONTROL_DT if free_period else 0.0
+                    while not fut.done() and not done():
+                        if held * CONTROL_DT < time.monotonic() - t_sent - free:  # never ahead of wall time
+                            step_once(held=True, render=video_held_steps and video)
+                            held += 1
+                        else:
+                            time.sleep(0.001)
+                    reply, latency = fut.result()
+                    # --free-period (a program-step policy, as RoboLab real-time mode): a request owes
+                    # only the latency beyond the control periods the previous chunk covered, since on
+                    # a robot it computes while that chunk moves. Otherwise it owes its whole latency.
+                    charged = max(0.0, latency - free)
+                    stats["charged_s"] += charged
+                    owed = int(math.ceil(max(0.0, charged - held * CONTROL_DT) / CONTROL_DT - 1e-6))
+                    for _ in range(owed):
+                        if done():
+                            break
                         step_once(held=True, render=video_held_steps and video)
                         held += 1
-                    else:
-                        time.sleep(0.001)
-                reply, latency = fut.result()
-                # --free-period (a program-step policy, as RoboLab real-time mode): a request owes
-                # only the latency beyond the control periods the previous chunk covered, since on
-                # a robot it computes while that chunk moves. Otherwise it owes its whole latency.
-                charged = max(0.0, latency - free)
-                stats["charged_s"] += charged
-                owed = int(math.ceil(max(0.0, charged - held * CONTROL_DT) / CONTROL_DT - 1e-6))
-                for _ in range(owed):
-                    if done():
-                        break
-                    step_once(held=True, render=video_held_steps and video)
-                    held += 1
-            else:
-                reply, latency = fut.result()
-                wall_anchor += latency  # the physics is frozen while waiting
-                if mode == "charged":
-                    # D9: the world stands still while the request is out, and its latency is
-                    # added to world time and the robot clock (free period as in realtime).
-                    c = max(0.0, latency - (prev_chunk_len * CONTROL_DT if free_period else 0.0))
-                    charged_world_s += c
-                    stats["charged_s"] += c
-                    mon.t += c  # monitor clock: a frozen open handle stays open for c
-            stats["latency_s"] += latency
-            stats["max_latency_s"] = max(stats["max_latency_s"], latency)
-            if done():
-                break
-            agent.enqueue_chunk(np.asarray(reply["actions"]))
-            prev_chunk_len = len(reply["actions"])
-        step_once(held=False, render=agent.queue_len == 0 or video)
-        if mon.success and t_native_success is None:
-            t_native_success = mon.t_success
+                else:
+                    reply, latency = fut.result()
+                    wall_anchor += latency  # the physics is frozen while waiting
+                    if mode == "charged":
+                        # D9: the world stands still while the request is out, and its latency is
+                        # added to world time and the robot clock (free period as in realtime).
+                        c = max(0.0, latency - (prev_chunk_len * CONTROL_DT if free_period else 0.0))
+                        charged_world_s += c
+                        stats["charged_s"] += c
+                        mon.t += c  # monitor clock: a frozen open handle stays open for c
+                stats["latency_s"] += latency
+                stats["max_latency_s"] = max(stats["max_latency_s"], latency)
+                if done():
+                    break
+                agent.enqueue_chunk(np.asarray(reply["actions"]))
+                prev_chunk_len = len(reply["actions"])
+            step_once(held=False, render=agent.queue_len == 0 or video)
+            if mon.success and t_native_success is None:
+                t_native_success = mon.t_success
 
-    # ------------------------------------------------------------------ record
-    t_world = world_steps * CONTROL_DT + charged_world_s
-    success = mon.success and not mon.fell
-    success_native = success and mon.t_success is not None and mon.t_success <= NATIVE_MAX_STEPS * CONTROL_DT
-    rec = {
-        "test_id": "5.4", "benchmark": "SIMPLE", "task": "OpenFaucet", "variant": variant,
-        "env_id": ENV_ID, "robot": "Unitree G1 whole-body (Dex3, decoupled WBC)",
-        "sim": f"MuJoCo 3.12 physics + Isaac Sim 6.2 render ({sim_mode})",
-        "seed": episode, "split": split, "data_dir": data_dir, "dataset_episode_index": global_episode,
-        "policy_id": policy_id, "policy_detail": policy_detail, "mode": mode,
-        "success": bool(success),
-        "success_native": bool(success_native),
-        "success_strict": bool(mon.success_strict() and not mon.fell),
-        "success_detail": mon.detail(),
-        "progress": round(mon.progress(), 3),
-        "t_wall_s": round(t_world, 3),           # world seconds (3a): sim time incl. charged latency
-        "t_world_s": round(t_world, 3),
-        "t_success_s": mon.t_success,
-        "t_host_s": round(time.monotonic() - t_host0, 1),
-        "policy_latency_s": round(stats["latency_s"], 3),
-        "charged_latency_s": round(stats["charged_s"], 3),
-        "requests": stats["requests"], "max_latency_s": round(stats["max_latency_s"], 3),
-        "held_steps": stats["held_steps"], "acting_steps": stats["acting_steps"],
-        "t_physics_s": round(world_steps * CONTROL_DT, 3), "charged_world_s": round(charged_world_s, 3),
-        "attempts": mon.attempts, "regrasps": mon.regrasps,
-        "retry_events": mon.retry_events, "irreversible": mon.irreversible,
-        "budget_s": budget_s, "final_q0_rad": round(mon.q0, 4), "free_period": free_period,
-        "instruction": instruction, "video": None,
-        "server_metadata": client.metadata if isinstance(client.metadata, dict) else None,
-    }
-    if writers:
-        for w in writers.values():
-            w.close()
-        names = [f"{stem}_{k}.mp4" for k in writers]
-        rec["video"] = [f"{gcs_prefix.rstrip('/')}/{n}" if gcs_prefix else str(out / n) for n in names]
-    (out / f"{stem}.json").write_text(json.dumps(rec, indent=2, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
-    print(json.dumps({k: rec[k] for k in ("success", "success_strict", "t_wall_s", "attempts", "irreversible", "success_detail")}), flush=True)
+        # ------------------------------------------------------------------ record
+        t_world = world_steps * CONTROL_DT + charged_world_s
+        success = mon.success and not mon.fell
+        success_native = success and mon.t_success is not None and mon.t_success <= NATIVE_MAX_STEPS * CONTROL_DT
+        rec = {
+            "test_id": "5.4", "benchmark": "SIMPLE", "task": "OpenFaucet", "variant": variant,
+            "env_id": ENV_ID, "robot": "Unitree G1 whole-body (Dex3, decoupled WBC)",
+            "sim": f"MuJoCo 3.12 physics + Isaac Sim 6.2 render ({sim_mode})",
+            "seed": episode, "split": split, "data_dir": data_dir, "dataset_episode_index": global_episode,
+            "policy_id": policy_id, "policy_detail": policy_detail, "mode": mode,
+            "success": bool(success),
+            "success_native": bool(success_native),
+            "success_strict": bool(mon.success_strict() and not mon.fell),
+            "success_detail": mon.detail(),
+            "progress": round(mon.progress(), 3),
+            "t_wall_s": round(t_world, 3),           # world seconds (3a): sim time incl. charged latency
+            "t_world_s": round(t_world, 3),
+            "t_success_s": mon.t_success,
+            "t_host_s": round(time.monotonic() - t_host0, 1),
+            "policy_latency_s": round(stats["latency_s"], 3),
+            "charged_latency_s": round(stats["charged_s"], 3),
+            "requests": stats["requests"], "max_latency_s": round(stats["max_latency_s"], 3),
+            "held_steps": stats["held_steps"], "acting_steps": stats["acting_steps"],
+            "t_physics_s": round(world_steps * CONTROL_DT, 3), "charged_world_s": round(charged_world_s, 3),
+            "attempts": mon.attempts, "regrasps": mon.regrasps,
+            "retry_events": mon.retry_events, "irreversible": mon.irreversible,
+            "budget_s": budget_s, "final_q0_rad": round(mon.q0, 4), "free_period": free_period,
+            "instruction": instruction, "video": None,
+            "server_metadata": client.metadata if isinstance(client.metadata, dict) else None,
+        }
+        if writers:
+            for w in writers.values():
+                w.close()
+            names = [f"{stem}_{k}.mp4" for k in writers]
+            rec["video"] = [f"{gcs_prefix.format(seed=episode).rstrip('/')}/{n}" if gcs_prefix else str(out / n) for n in names]
+        (out / f"{stem}.json").write_text(json.dumps(rec, indent=2, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
+        print(json.dumps({k: rec[k] for k in ("success", "success_strict", "t_wall_s", "attempts", "irreversible", "success_detail")}), flush=True)
+    for k in seeds:
+        try:
+            run_one(k)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            print(json.dumps({"seed": k, "error": "episode crashed; see traceback"}), flush=True)
     client.close()
     pool.shutdown(wait=False)
     os._exit(0)  # Isaac's shutdown hangs; the record is already on disk
