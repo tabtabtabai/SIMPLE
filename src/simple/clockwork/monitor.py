@@ -18,8 +18,10 @@ Definitions (Clockwork CONTRACT.md 3, 3b, D1):
                   - setback "fell_back": the handle returns inside +-OPEN_RAD after having
                     been open, before upstream success; the retry is counted when it is
                     opened again
-                  - "regrasp": hand-faucet contact lost for >= CONTACT_LOSS_S after having
-                    been in contact for >= CONTACT_MIN_S, then regained, before success
+                  - "regrasp": a grip that was doing work is lost and taken again: the hand
+                    was in contact while the handle turned >= ENGAGE_RAD from its start, then
+                    contact was lost for >= CONTACT_LOSS_S and regained, before success.
+                    Brushes on the approach (contact before the handle has moved) never count.
   regrasps        count of "regrasp" events (also counted in attempts)
   irreversible    robot_fell: pelvis height < FALL_Z_M or base tilt > FALL_TILT_RAD,
                   sustained for FALL_HOLD_S
@@ -36,6 +38,7 @@ OPEN_RAD = 0.7
 STRICT_HOLD_S = 1.0
 CONTACT_MIN_S = 0.10
 CONTACT_LOSS_S = 0.25
+ENGAGE_RAD = 0.10
 FALL_Z_M = 0.40
 FALL_TILT_RAD = np.deg2rad(60.0)
 FALL_HOLD_S = 0.20
@@ -68,6 +71,8 @@ class FaucetMonitor:
     lost_since: float | None = None
     had_contact: bool = False
     ever_contact: bool = False
+    engaged: bool = False  # the hand has turned the handle while in contact
+    q0_start: float | None = None
     # fall
     low_since: float | None = None
     fell: bool = False
@@ -82,6 +87,8 @@ class FaucetMonitor:
         self.t += self.dt
         t = self.t
         self.q0 = float(q0)
+        if self.q0_start is None:
+            self.q0_start = self.q0
         self.max_abs_q0 = max(self.max_abs_q0, abs(self.q0))
         is_open = abs(self.q0) > OPEN_RAD
 
@@ -110,13 +117,15 @@ class FaucetMonitor:
                 self.contact_since = t
             if self.lost_since is not None:
                 lost_for = t - self.lost_since
-                if self.had_contact and lost_for >= CONTACT_LOSS_S and not self.success:
+                if self.engaged and lost_for >= CONTACT_LOSS_S and not self.success:
                     self.regrasps += 1
                     self.retry_events.append({"t": round(t, 3), "kind": "regrasp",
                                               "lost_s": round(lost_for, 3)})
                 self.lost_since = None
             if t - self.contact_since + self.dt >= CONTACT_MIN_S:
                 self.had_contact = True
+            if self.had_contact and abs(self.q0 - self.q0_start) >= ENGAGE_RAD:
+                self.engaged = True
         else:
             if self.contact_since is not None and self.lost_since is None:
                 self.lost_since = t

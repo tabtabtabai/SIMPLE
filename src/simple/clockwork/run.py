@@ -170,6 +170,7 @@ def main(
     send_cameras: Annotated[str, typer.Option(help="comma list of image keys to send")] = "head_stereo_left,head_stereo_right,third_person",
     pace: Annotated[bool, typer.Option(help="never let world time run ahead of wall time (as upstream)")] = True,
     variant: Annotated[str, typer.Option(help="native | near-start (scored separately)")] = "native",
+    policy_detail: Annotated[str, typer.Option(help="what policy_id is, e.g. 'teleop replay of demo k'")] = "",
     free_period: Annotated[bool, typer.Option("--free-period/--no-free-period",
         help="program-step policy: a request owes only latency beyond the previous chunk's control periods")] = False,
 ):
@@ -346,7 +347,7 @@ def main(
         "env_id": ENV_ID, "robot": "Unitree G1 whole-body (Dex3, decoupled WBC)",
         "sim": f"MuJoCo 3.12 physics + Isaac Sim 6.2 render ({sim_mode})",
         "seed": episode, "split": split, "data_dir": data_dir, "dataset_episode_index": global_episode,
-        "policy_id": policy_id, "mode": mode,
+        "policy_id": policy_id, "policy_detail": policy_detail, "mode": mode,
         "success": bool(success),
         "success_native": bool(success_native),
         "success_strict": bool(mon.success_strict() and not mon.fell),

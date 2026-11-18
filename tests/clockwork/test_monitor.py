@@ -50,8 +50,18 @@ def test_contact_flicker_is_not_a_regrasp():
 
 def test_slip_and_regrasp_counts():
     m = FaucetMonitor(dt=DT)
-    feed(m, [0.1] * 40, contact=lambda i: not (10 <= i < 25))  # 0.3 s lost
+    # handle turned 0 -> 0.3 while gripped, grip lost 0.3 s, taken again
+    qs = [0.0] * 5 + [0.3] * 35
+    feed(m, qs, contact=lambda i: not (10 <= i < 25))
     assert m.regrasps == 1 and m.attempts == 2
+
+
+def test_approach_brush_then_grasp_is_not_a_regrasp():
+    """Replay seed 0: the hand brushes the faucet, loses it for 1.4 s, then grasps and turns."""
+    m = FaucetMonitor(dt=DT)
+    qs = [0.0] * 200 + [i * 0.01 for i in range(100)]
+    feed(m, qs, contact=lambda i: (100 <= i < 110) or i >= 180)
+    assert m.regrasps == 0 and m.attempts == 1
 
 
 def test_first_approach_contact_is_not_a_regrasp():
