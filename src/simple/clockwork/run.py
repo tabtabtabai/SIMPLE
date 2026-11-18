@@ -113,6 +113,30 @@ class MjProbe:
         return out
 
 
+# ---------------------------------------------------------------------------- cameras
+# A fixed view from the robot's right, above the sink, looking at the faucet. eye_on_base poses are
+# in the robot's spawn frame in Isaac (camera parented to the robot prim); x forward, z up.
+THIRD_PERSON_POS = (0.35, -1.25, 1.45)
+THIRD_PERSON_LOOK_AT = (0.45, 0.0, 0.85)
+
+
+def add_third_person_camera() -> None:
+    """Add `third_person` to the OpenFaucet task's sensors (not seen by Psi0, which reads only
+    head_stereo_left). Cameras are rebuilt from sensor_cfgs on every reset, state dicts included."""
+    from simple.sensors.config import CameraCfg
+    from simple.tasks.g1_wholebody_open_faucet_teleop import G1WholebodyOpenFaucetTaskTeleop as T
+
+    if "third_person" in T.sensor_cfgs:
+        return
+    d = np.subtract(THIRD_PERSON_LOOK_AT, THIRD_PERSON_POS)
+    pitch = float(-np.arctan2(d[2], np.linalg.norm(d[:2])))
+    yaw = float(np.arctan2(d[1], d[0]))
+    T.sensor_cfgs = {**T.sensor_cfgs, "third_person": CameraCfg(
+        uid="Realsense_D415_mono", mount="eye_on_base", width=640, height=360,
+        focal_length=1.88, fov=float(np.deg2rad(71.28)), near=0.1, far=6,
+        pose=dict(position=list(THIRD_PERSON_POS), eulers=(0.0, pitch, yaw)))}
+
+
 # ---------------------------------------------------------------------------- dataset
 TASK_UID = "g1_wholebody_open_faucet_teleop"
 
@@ -170,6 +194,7 @@ def main(
     send_cameras: Annotated[str, typer.Option(help="comma list of image keys to send")] = "head_stereo_left,head_stereo_right,third_person",
     pace: Annotated[bool, typer.Option(help="never let world time run ahead of wall time (as upstream)")] = True,
     variant: Annotated[str, typer.Option(help="native | near-start (scored separately)")] = "native",
+    third_person: Annotated[bool, typer.Option("--third-person/--no-third-person")] = True,
     policy_detail: Annotated[str, typer.Option(help="what policy_id is, e.g. 'teleop replay of demo k'")] = "",
     free_period: Annotated[bool, typer.Option("--free-period/--no-free-period",
         help="program-step policy: a request owes only latency beyond the previous chunk's control periods")] = False,
@@ -190,6 +215,8 @@ def main(
     stem = f"{split}_ep{episode}"
 
     env_conf, global_episode = load_episode(data_dir, episode)
+    if third_person:
+        add_third_person_camera()
     sonic_config = _make_sonic_config()
     raw_env = gym.make(ENV_ID, sim_mode=sim_mode, render_hz=50, headless=True, sonic_config=sonic_config)
     senv = raw_env.unwrapped
