@@ -462,6 +462,7 @@ def main(
         "faucet_base_world": [round(float(v), 4) for v in probe.faucet_base()],
         "near_start_dx": near_start_dx, "spawn_shift": spawn_shift,
         "physics_qa": qa.report(), "render_version": 1,
+        "wrapper_sha": os.environ.get("CW5_FORK_SHA", "unknown"),
             "instruction": instruction, "video": None,
             "server_metadata": client.metadata if isinstance(client.metadata, dict) else None,
         }
